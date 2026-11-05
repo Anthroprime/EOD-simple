@@ -13,6 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { JSDOM, SKIP } from './helpers/jsdom.mjs';
+import { installPreflightCapture, confirmPreflight } from './helpers/mic-preflight.mjs';
 
 const flush = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
 // Node's own timer fns, captured before any test swaps globals.
@@ -113,7 +114,7 @@ function setup({ pages = [payload()], token = 'tok', ack = true, assessments = [
   window.localStorage.setItem('ecod.token', token);
   // The rules gate is remembered per browser session; pre-acknowledge it so the
   // render goes straight to the paper, like a candidate mid-exam.
-  if (ack) window.sessionStorage.setItem('ecod.exam.ack.asm1', '1');
+  if (ack) window.sessionStorage.setItem('ecod.exam.ack.asm1', 'microphone-confirmed-v1');
   return {
     dom, window, calls, harness,
     async teardown() {
@@ -183,7 +184,7 @@ test('an open-question answer window keeps its one-minute budget (no 30s clamp)'
   } finally { await h.teardown(); }
 });
 
-test('the exam clock does not start until the rules are acknowledged', { skip: SKIP }, async () => {
+test('the exam clock does not start until the microphone check and rules are confirmed', { skip: SKIP }, async () => {
   // The first question's clock used to begin the moment the candidate opened
   // the exam hash — the rules gate did a GET that started the server clock, so
   // a candidate who read the rules for 20s met question one already 20s in.
@@ -196,6 +197,7 @@ test('the exam clock does not start until the rules are acknowledged', { skip: S
   });
   try {
     const view = h.window.document.getElementById('view');
+    installPreflightCapture(h.window);
     const { state } = await import('../public/js/app.js');
     state.user = { username: 'cand', role: 'candidate' };
     state.meta = META;
@@ -213,6 +215,8 @@ test('the exam clock does not start until the rules are acknowledged', { skip: S
     const ack = view.querySelector('#exam-ack');
     ack.checked = true;
     ack.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+    assert.equal(view.querySelector('#exam-enter').disabled, true, 'rules alone cannot bypass the microphone test');
+    await confirmPreflight(view, h.window);
     view.querySelector('#exam-enter').click();
     for (let i = 0; i < 30 && !/Question\s*\d/.test(textOf(view)); i += 1) await flush(50);
 

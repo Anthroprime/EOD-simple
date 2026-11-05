@@ -187,7 +187,7 @@ function setup({ pages = [payload()], nextError = null, draftReply = null, mic =
   const savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
   if (mic) Object.defineProperty(globalThis, 'navigator', { configurable: true, writable: true, value: window.navigator });
   window.localStorage.setItem('ecod.token', 'tok');
-  window.sessionStorage.setItem('ecod.exam.ack.asm1', '1');
+  window.sessionStorage.setItem('ecod.exam.ack.asm1', 'microphone-confirmed-v1');
   const drafts = () => calls.filter((c) => c.method === 'PUT' && c.path.includes('/answers'));
   const locks = () => calls.filter((c) => c.method === 'POST' && c.path.includes('/next'));
   return {

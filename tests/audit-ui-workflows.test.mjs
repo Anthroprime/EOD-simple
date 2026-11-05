@@ -4,6 +4,7 @@ import { SKIP } from './helpers/jsdom.mjs';
 import { bootSpa, flush, type } from './helpers/spa.mjs';
 import { makeWorld } from './helpers/world.mjs';
 import { hashPassword } from '../src/core/passwords.mjs';
+import { installPreflightCapture, confirmPreflight } from './helpers/mic-preflight.mjs';
 
 const candidate = { id: 'c1', name: 'UI Audit', stage: 'assessment' };
 const paper = { id: 'a1', status: 'assigned', access_state: 'upcoming', role_name: 'Scheduled track', question_count: 2,
@@ -89,8 +90,10 @@ test('a failed hall-entry request restores an acknowledged gate and can be retri
     app: (ctx) => ctx.method === 'GET' && ctx.path === `/candidate/assessments/${c.assessmentId}` && fail
       ? Promise.resolve({ status: 503, body: { error: 'Entry temporarily unavailable' } }) : w.app(ctx) } });
   try {
+    installPreflightCapture(spa.window);
     const { quizView } = await import('../public/js/views/candidate.js'); await quizView(spa.view, { id: c.assessmentId });
     const ack = spa.view.querySelector('#exam-ack'); ack.checked = true; ack.onchange();
+    await confirmPreflight(spa.view, spa.window);
     await spa.view.querySelector('#exam-enter').onclick(); await flush(30);
     assert.match(spa.text(), /Entry temporarily unavailable/);
     assert.equal(spa.view.querySelector('#exam-ack').checked, true);

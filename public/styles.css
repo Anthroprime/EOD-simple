@@ -649,6 +649,28 @@ body.exam-lock .view {
 }
 
 .exam-audio-playback { display: block; width: 100%; max-width: 420px; margin-top: 10px; }
+.exam-audio-playback[hidden], .audio-quality-warning[hidden] { display: none; }
+.microphone-input { min-width: 0; width: 100%; margin: 12px 0; }
+.mic-input-picker { display: block; font-size: 13px; font-weight: 700; line-height: 1.5; }
+.mic-input-picker select { display: block; width: 100%; min-width: 0; max-width: 100%; margin-top: 6px; min-height: 44px; font-size: 14px; }
+.mic-device-name { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mic-level-row { display: flex; align-items: center; gap: 12px; margin: 12px 0 8px; }
+.mic-level-row meter { flex: 1; width: 100%; min-width: 40px; height: 14px; }
+.mic-level-row > span { flex: 0 0 auto; color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.mic-input-status { margin: 8px 0; line-height: 1.6; min-height: 2em; }
+.microphone-input:is([data-state="quiet"],[data-state="paused"],[data-state="muted"],[data-state="ended"],[data-state="clipped"]) .mic-input-status { color: var(--red); font-weight: 600; }
+.microphone-input[data-state="good"] .mic-input-status { color: var(--green); }
+.mic-confirm { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; line-height: 1.6; margin-top: 14px; }
+.mic-confirm input { flex-shrink: 0; margin-top: 5px; }
+.exam-preflight { margin: 24px 0; padding: 20px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--surface-2); }
+.exam-preflight h2 { margin: 0 0 10px; font-size: 20px; }
+.exam-preflight audio, .journey-device-check audio { width: 100%; max-width: 480px; margin: 12px 0; }
+.audio-quality-warning { grid-column: 1 / -1; min-width: 0; padding: 18px; border-radius: var(--radius); border: 1px solid var(--amber-line); background: var(--amber-bg); color: var(--ink); }
+.audio-quality-warning > p:first-child { font-weight: 700; font-size: 14px; }
+.audio-quality-warning > p { line-height: 1.6; margin-bottom: 12px; }
+.exam-audio-side .mic-level-row { flex-wrap: wrap; gap: 6px; }
+.exam-audio-side .mic-level-row > span { flex-basis: 100%; }
+@media (max-width: 650px) { .mic-input-picker select { font-size: 16px; }.exam-preflight { padding: 16px; } }
 .exam-actions { margin: 8px 0 40px; }
 @media (max-width: 650px) {
   .exam-chrome { flex-direction: column; align-items: stretch; }
