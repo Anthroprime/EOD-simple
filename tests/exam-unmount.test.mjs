@@ -98,7 +98,7 @@ async function boot() {
   };
   for (const [k, v] of Object.entries(globals)) globalThis[k] = v;
   window.localStorage.setItem('ecod.token', 'tok');
-  window.sessionStorage.setItem('ecod.exam.ack.asm1', '1');
+  window.sessionStorage.setItem('ecod.exam.ack.asm1', 'microphone-confirmed-v1');
   const originalOpen = window.open;
   await import('../public/js/app.js');
   const view = window.document.getElementById('view');

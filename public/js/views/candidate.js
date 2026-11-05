@@ -1,4 +1,5 @@
 import { wireMicrophoneCheck } from '../microphone-check.js';
+import { openMicrophone, microphoneInputMarkup, wireMicrophoneInput, monitorMicrophone, recordingQualityWarning, MIN_INPUT_MS } from '../microphone-input.js';
 import { api, session, setExamOtherDeviceHandler, deviceId } from '../api.js';
 import { state, VIEW_UNMOUNT_EVENT } from '../app.js';
 import {
@@ -13,6 +14,9 @@ import {
 
 const scheduledTime = fmtScheduledTime;
 const portalCleanup = new WeakMap();
+const preflightCleanup = new WeakMap();
+// Older rules-only acknowledgements must not bypass the mandatory voice check.
+const EXAM_ENTRY_CONFIRMATION = 'microphone-confirmed-v1';
 
 const closedAccess = (a) => ['upcoming', 'cancelled', 'unavailable'].includes(a.access_state);
 /** What the candidate should do about one assessment, in one sentence. */
@@ -168,10 +172,11 @@ function renderOtherDevice(view, id, { movedAway = false } = {}) {
 }
 
 export async function quizView(view, { id, takeover = false }) {
+  preflightCleanup.get(view)?.();
   view.innerHTML = loading();
   const gateKey = `ecod.exam.ack.${id}`;
 
-  if (!sessionStorage.getItem(gateKey)) {
+  if (sessionStorage.getItem(gateKey) !== EXAM_ENTRY_CONFIRMATION) {
     // The rules gate must render BEFORE the exam starts: the first question's
     // clock begins the moment the server is asked for the exam, so the gate
     // reads the non-mutating assessments list (status, role and question count)
@@ -195,11 +200,11 @@ export async function quizView(view, { id, takeover = false }) {
       return;
     }
     renderExamGate(view, {
-      assessment: { role: { name: a.role_name || 'this role' }, scheduled_at: a.scheduled_at, expires_at: a.expires_at },
+      assessment: { status: a.status, role: { name: a.role_name || 'this role' }, scheduled_at: a.scheduled_at, expires_at: a.expires_at },
       exam: { total: a.question_count || 0 },
     }, async () => {
-      sessionStorage.setItem(gateKey, '1');
-      try { await quizView(view, { id }); }
+      sessionStorage.setItem(gateKey, EXAM_ENTRY_CONFIRMATION);
+      try { await quizView(view, { id, takeover }); }
       catch (err) { sessionStorage.removeItem(gateKey); throw err; }
     });
     return;
@@ -232,8 +237,14 @@ export async function quizView(view, { id, takeover = false }) {
 }
 
 function renderExamGate(view, d, onStart, entryError = null) {
+  preflightCleanup.get(view)?.();
   document.body.classList.add('exam-lock');
   const total = d.exam?.total || 0;
+  const captureSupported = micCapability(window).canRecord;
+  // A fresh browser session must check its input even when resuming a paper.
+  // An immediate entry retry retains the check just completed on this gate.
+  const needsCheck = !entryError;
+  const resuming = d.assessment.status === 'in_progress';
   view.innerHTML = `
     <div class="exam-hall">
       <div class="exam-seal card">
@@ -253,11 +264,12 @@ function renderExamGate(view, d, onStart, entryError = null) {
           <li><b>Two-hour exam window.</b> ${d.assessment.scheduled_at ? `Your booked window is ${esc(scheduledTime(d.assessment.scheduled_at))} to ${esc(scheduledTime(d.assessment.expires_at))}. Joining late does not extend the closing time.` : 'It starts when you enter the exam hall.'} It runs continuously, including when you close the browser or sign out. At expiry the exam closes and saved answers remain available for review.</li>
           <li><b>Multiple-choice &amp; scale:</b> 30 seconds to answer. Multi-select items score only on an exact match — any incorrect choice scores the question at zero, with no partial credit.</li>
           <li><b>Open / scenario:</b> 30 seconds to review the scenario, then 60 seconds to <b>record your answer with the microphone</b>. Every open question is answered out loud; the text box beside the recorder is optional space for supporting notes. Speech is transcribed when the browser allows it.</li>
-          <li><b>Microphone.</b> An open question cannot be locked without a recording, so allow the browser's microphone prompt. Granting access on the review screen keeps the dialog from eating your answer time.</li>
+          <li><b>Mandatory microphone check.</b> Record a spoken sentence, play it back and confirm you can hear your voice before entering. During open questions, watch the level meter and check any input warning.</li>
           <li><b>Integrity.</b> Copying the question is blocked. Switching tabs, pasting, or leaving fullscreen is logged.</li>
           <li><b>Time expiry</b> auto-submits the current item (blank if unanswered) and advances.</li>
         </ul>
-        <p class="exam-mic-tip small muted">Tip: test your microphone on My Journey first, and keep this tab in full screen until you submit.</p>
+        ${captureSupported ? `<section class="exam-preflight" aria-label="Microphone check"><h2>Required: test your microphone</h2><p class="small muted">${needsCheck ? (resuming ? 'Test your microphone before resuming. Your existing exam clock continues running during this check.' : 'Complete this test before starting the paper. Your booked closing time still applies.') : 'Your microphone test is confirmed for this entry retry.'} The test recording stays on this device.</p><div class="row"><button type="button" class="btn secondary" data-mic-start>Test microphone</button><button type="button" class="btn secondary" data-mic-stop disabled>Stop test</button></div><p class="small muted" data-mic-status role="status">Speak a sentence, stop, then listen and confirm your voice.</p><audio data-mic-player controls hidden aria-label="Microphone test playback"></audio></section>` : '<p class="exam-mic-note" role="alert">You cannot enter without a microphone test. Microphone recording is unavailable in this browser. Open this page in Chrome or Edge over HTTPS (or localhost), connect a microphone and try again.</p>'}
+        <p id="exam-mic-requirement" class="small muted">${needsCheck ? 'Complete and confirm your microphone test, then acknowledge the rules to enter.' : ''}</p>
         <label class="check exam-ack"><input type="checkbox" id="exam-ack" ${entryError ? 'checked' : ''}/> <span>I understand these conditions and will complete the exam independently.</span></label>
         <div class="row" style="margin-top:18px">
           <button class="btn" id="exam-enter" ${entryError ? '' : 'disabled'}>${entryError ? 'Retry exam entry' : 'Enter exam hall →'}</button>
@@ -266,9 +278,21 @@ function renderExamGate(view, d, onStart, entryError = null) {
     </div>`;
   const ack = view.querySelector('#exam-ack');
   const btn = view.querySelector('#exam-enter');
-  ack.onchange = () => { btn.disabled = !ack.checked; };
+  let micReady = !needsCheck;
+  const syncEntry = () => { btn.disabled = !captureSupported || !ack.checked || !micReady; };
+  let disposeCheck = () => {};
+  const cleanup = () => {
+    disposeCheck(); view.ownerDocument.removeEventListener(VIEW_UNMOUNT_EVENT, cleanup);
+    if (preflightCleanup.get(view) === cleanup) preflightCleanup.delete(view);
+  };
+  if (captureSupported) disposeCheck = wireMicrophoneCheck(view.querySelector('.exam-preflight'), { onReadyChange: ready => { micReady = ready; syncEntry(); } });
+  preflightCleanup.set(view, cleanup);
+  view.ownerDocument.addEventListener(VIEW_UNMOUNT_EVENT, cleanup, { once: true });
+  ack.onchange = syncEntry;
+  syncEntry();
   btn.onclick = async () => {
-    if (btn.disabled) return;
+    if (btn.disabled || !captureSupported || !ack.checked || !micReady || (needsCheck && !disposeCheck.isReady?.())) return;
+    cleanup();
     btn.disabled = true;
     try { await document.documentElement.requestFullscreen?.(); } catch { /* optional */ }
     try { await onStart(); }
@@ -867,9 +891,9 @@ async function runExamSession(view, id, payload) {
           micCheck.disabled = true;
           micCheckState.textContent = 'Waiting for the browser permission prompt…';
           try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const stream = await openMicrophone(window);
             stream.getTracks().forEach((t) => t.stop());
-            micCheckState.textContent = '✓ Microphone ready. Recording will now start without a prompt.';
+            micCheckState.textContent = 'Microphone access granted. Watch the input meter when you record your answer.';
             micCheckState.classList.add('ok');
           } catch {
             micCheckState.textContent = 'Microphone blocked — open the browser’s site permissions, allow the microphone, then check again.';
@@ -955,6 +979,7 @@ async function runExamSession(view, id, payload) {
           <textarea id="exam-ta" rows="8" maxlength="20000" placeholder="${needsMic ? 'Optional notes — the recording below is your answer' : 'Type your answer here'}">${esc(text)}</textarea>
           ${needsMic ? `
           <div class="exam-audio-side">
+            ${microphoneInputMarkup({ selectable: false })}
             <button type="button" class="btn rec-btn" id="rec-btn" aria-pressed="false">
               <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"></rect><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"></path></svg>
               <span id="rec-label">Record answer</span>
@@ -964,6 +989,7 @@ async function runExamSession(view, id, payload) {
           </div>` : ''}
           ${needsMic && !micCapable ? `<div class="small exam-mic-note warn">This browser cannot capture microphone audio, so a recording cannot be required here. Type your answer instead — it is stored and flagged for the assessor as “no recording”.</div>` : ''}
           ${needsMic ? '<p class="small muted" id="caption-status" role="status"></p>' : ''}
+          ${needsMic ? '<audio id="answer-audio-preview" class="exam-audio-playback" controls hidden aria-label="Recorded answer playback"></audio><div class="audio-quality-warning" id="audio-quality-warning" hidden><p role="alert" id="audio-quality-message"></p><p class="small">Play this recording and check your voice. You can record again while time remains. The timer continues; at expiry your available recording is saved.</p><button type="button" class="btn secondary sm" id="keep-question-audio" disabled>Keep this recording &amp; continue</button></div>' : ''}
           <div class="small muted transcript-block" id="transcript-preview" ${transcript ? '' : 'hidden'}></div>
         </div>`;
       const ta = body.querySelector('#exam-ta');
@@ -991,6 +1017,22 @@ async function runExamSession(view, id, payload) {
       const recState = body.querySelector('#rec-state');
       const recTimer = body.querySelector('#rec-timer');
       const preview = body.querySelector('#transcript-preview');
+      const audioPreview = body.querySelector('#answer-audio-preview');
+      const qualityBox = body.querySelector('#audio-quality-warning');
+      const keepAudio = body.querySelector('#keep-question-audio');
+      let previewPlayed = false;
+      const qualityWarning = () => rec.failure || recordingQualityWarning(rec.quality);
+      const showQualityWarning = () => {
+        if (!qualityBox) return;
+        const message = qualityWarning();
+        qualityBox.hidden = !message || rec.qualityConfirmed === true;
+        body.querySelector('#audio-quality-message').textContent = message;
+        keepAudio.disabled = !previewPlayed || !rec.audioB64;
+      };
+      audioPreview?.addEventListener('play', () => { previewPlayed = true; showQualityWarning(); });
+      const inputControl = needsMic ? wireMicrophoneInput(body.querySelector('[data-mic-input]'), { onChange: reason => {
+        if (reason === 'selection') setRecState('Microphone changed. Record again to use this input.', 'muted');
+      } }) : null;
       if (transcript) { preview.hidden = false; preview.textContent = `Transcript: ${transcript}`; }
       const hasAnswer = () => Boolean((ta?.value || text).trim() || transcript.trim() || rec.audioB64 || rec.keptRef);
       // Require actual audio on browsers with capture support. A transcript
@@ -999,7 +1041,8 @@ async function runExamSession(view, id, payload) {
       // stop(), and "Lock & continue" stops the recording first, so the button
       // must not deadlock a candidate mid-sentence.
       const hasSpoken = () => Boolean(rec.audioB64 || rec.keptRef
-        || (rec.startedAt && Date.now() - rec.startedAt >= 400));
+        || (rec.startedAt && rec.recorder?.state === 'recording'
+          && (rec.monitor?.summary().available ? rec.monitor.summary().inputMs >= MIN_INPUT_MS : Date.now() - rec.startedAt >= 400)));
       const enforceMic = needsMic && micCapable;
       const hasEnough = () => (enforceMic ? hasSpoken() : hasAnswer());
       const setRecState = (message, tone = 'muted') => {
@@ -1010,9 +1053,10 @@ async function runExamSession(view, id, payload) {
         recState.classList.toggle('warn', tone === 'warn');
       };
       const syncNext = () => {
-        nextBtn.disabled = !hasEnough();
+        nextBtn.disabled = !hasEnough() || Boolean(qualityWarning() && !rec.qualityConfirmed);
         nextBtn.title = nextBtn.disabled
-          ? (enforceMic ? 'Record your spoken answer to continue — typed notes alone are not an answer' : 'Add an answer before continuing')
+          ? (qualityWarning() && !rec.qualityConfirmed ? 'Check playback and confirm the recording warning, or record again'
+            : enforceMic ? 'Record your spoken answer to continue — typed notes alone are not an answer' : 'Add an answer before continuing')
           : '';
       };
       if (existing.audio_b64) rec.audioB64 = existing.audio_b64;
@@ -1044,9 +1088,11 @@ async function runExamSession(view, id, payload) {
         ? 'Live captions start with recording and require the browser speech service.'
         : 'Live captions are not supported in this browser. Use Chrome or Edge for captions; audio recording is still available.';
       const releaseMic = () => {
+        if (rec.monitor) { rec.quality = rec.monitor.summary(); rec.monitor.dispose(); rec.monitor = null; }
         rec.stream?.getTracks().forEach((t) => t.stop());
         rec.stream = null;
         rec.startedAt = 0;
+        inputControl?.setRecording(false);
         if (recTimer) recTimer.hidden = true;
       };
       stopLiveCapture = () => {
@@ -1056,6 +1102,9 @@ async function runExamSession(view, id, payload) {
         rec.recognition = null;
         try { if (rec.recorder?.state !== 'inactive') rec.recorder?.stop(); } catch { /* leaving the screen */ }
         releaseMic();
+        inputControl?.dispose();
+        if (audioPreview && !audioPreview.paused) audioPreview.pause();
+        audioPreview?.removeAttribute('src');
       };
       onTick = () => {
         if (recTimer && !recTimer.hidden) recTimer.textContent = recElapsed();
@@ -1089,6 +1138,11 @@ async function runExamSession(view, id, payload) {
             toast('The recording exceeded the storage limit and was not saved.', 'error', 4200);
           }
         }
+        if (rec.audioB64 && audioPreview) {
+          audioPreview.src = `data:${rec.audioMime};base64,${rec.audioB64}`;
+          audioPreview.hidden = false;
+        }
+        showQualityWarning();
         if (SpeechRec && !transcript && !captionFailure && captionStatus)
           captionStatus.textContent = 'No caption text was returned. The audio recording is saved separately; captions are optional.';
       })().finally(() => { stopping = null; }));
@@ -1106,8 +1160,9 @@ async function runExamSession(view, id, payload) {
               recBtn.classList.remove('recording');
               recBtn.setAttribute('aria-pressed', 'false');
               setRecState(hasSpoken()
-                ? 'Audio captured · you can continue'
+                ? qualityWarning() || 'Audio captured · play it back to check your voice'
                 : 'Recording stopped with nothing captured — press record and speak again.', hasSpoken() ? 'ok' : 'warn');
+              if (qualityWarning()) setRecState(qualityWarning(), 'warn');
               syncNext();
               // The clip is the answer: it goes to the server now, not only
               // with the lock, so a lock lost to a timeout cannot lose it.
@@ -1124,8 +1179,9 @@ async function runExamSession(view, id, payload) {
             // the unlock must not fire on that wait.
             if (recTimer) recTimer.hidden = true;
             setRecState('Waiting for microphone permission…', 'muted');
+            inputControl?.setRecording(true);
             try {
-              const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+              const stream = await openMicrophone(window);
               if (!stillHere() || rec.cancelled || lockingCapture) {
                 stream.getTracks().forEach((track) => track.stop());
                 return;
@@ -1137,21 +1193,56 @@ async function runExamSession(view, id, payload) {
               const chunks = [];
               rec.chunks = chunks;
               rec.recorder.ondataavailable = (e) => { if (e.data?.size) chunks.push(e.data); };
+              const activeRecorder = rec.recorder;
+              const recorderProblem = (event) => {
+                if (rec.cancelled || rec.recorder !== activeRecorder || !stillHere()) return;
+                rec.failure = 'The recorder stopped unexpectedly. Stop and check playback, or record again.';
+                setRecState(rec.failure, 'warn'); showQualityWarning(); syncNext();
+                // The stop event follows the final data event. Finish only here,
+                // not on error (which can precede the final chunk).
+                if (event.type === 'stop') {
+                  captureBusy = true; recBtn.disabled = true;
+                  rec.failure = 'The recording ended unexpectedly. Check the saved audio or record again.';
+                  stopCapture().then(() => {
+                    if (!stillHere()) return;
+                    recLabel.textContent = 'Record answer'; recBtn.classList.remove('recording'); recBtn.setAttribute('aria-pressed', 'false');
+                    setRecState(rec.failure, 'warn'); showQualityWarning(); syncNext();
+                    queueDraft(q.id, currentOpenAnswer(), DRAFT_DELAY_MS.now);
+                  }).catch(error => {
+                    if (stillHere()) setRecState(error.message || 'Recording could not be finished. Record again before continuing.', 'warn');
+                  }).finally(() => { captureBusy = false; if (stillHere()) recBtn.disabled = false; });
+                }
+              };
+              // Keep these listeners independent of the final stop/flush handlers.
+              rec.recorder.addEventListener?.('error', recorderProblem);
+              rec.recorder.addEventListener?.('stop', recorderProblem);
               rec.recorder.start();
               rec.audioB64 = ''; rec.audioMime = ''; rec.keptRef = false;
+              rec.quality = null; rec.failure = ''; rec.qualityConfirmed = false; previewPlayed = false;
+              if (audioPreview) { if (!audioPreview.paused) audioPreview.pause(); audioPreview.removeAttribute('src'); audioPreview.hidden = true; }
+              showQualityWarning();
               transcript = '';
               preview.textContent = '';
               preview.hidden = true;
               rec.startedAt = Date.now();
+              rec.monitor = monitorMicrophone(window, rec.stream, { onUpdate: snapshot => {
+                if (!stillHere() || rec.cancelled) return;
+                inputControl?.show(snapshot);
+                if (['muted', 'ended'].includes(snapshot.state)) setRecState('Microphone input interrupted — stop and check your device.', 'warn');
+                syncNext();
+              } });
+              inputControl?.refresh();
               if (recTimer) { recTimer.hidden = false; recTimer.textContent = '0:00'; }
               setRecState('Recording — speak clearly', 'ok');
               syncNext();
-            } catch {
+            } catch (error) {
               releaseMic(); rec.recorder = null;
               recBtn.classList.remove('recording');
               recBtn.setAttribute('aria-pressed', 'false');
               recLabel.textContent = 'Record answer';
-              setRecState('Microphone unavailable — check microphone permission and device access, then try again.', 'warn');
+              setRecState(error.name === 'NotFoundError' || error.name === 'OverconstrainedError'
+                ? 'Microphone unavailable — reconnect the input selected before the test and record again.'
+                : 'Microphone unavailable — check microphone permission and device access, then try again.', 'warn');
               toast('Could not start audio recording. Check microphone access and try again.', 'error', 4200);
               syncNext();
               return;
@@ -1217,6 +1308,11 @@ async function runExamSession(view, id, payload) {
         const timedOut = nextBtn.dataset.force === '1';
         try {
           await stopCapture();
+          if (!timedOut && qualityWarning() && !rec.qualityConfirmed) {
+            showQualityWarning(); syncNext();
+            body.querySelector('#audio-quality-message')?.scrollIntoView?.({ block: 'nearest' });
+            return;
+          }
           if (!hasEnough() && !timedOut) {
             syncNext();
             toast(enforceMic
@@ -1238,6 +1334,11 @@ async function runExamSession(view, id, payload) {
         } finally {
           lockingCapture = false;
         }
+      };
+      if (keepAudio) keepAudio.onclick = async () => {
+        if (!previewPlayed || !rec.audioB64 || lockingCapture || advancing) return;
+        rec.qualityConfirmed = true; showQualityWarning(); syncNext();
+        await nextBtn.onclick();
       };
     }
 

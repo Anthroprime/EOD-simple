@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM, SKIP } from './helpers/jsdom.mjs';
 import { wireMicrophoneCheck } from '../public/js/microphone-check.js';
+import { syntheticMicrophone } from './helpers/microphone.mjs';
 import { uniqueUsername, generatePassword } from '../public/js/account-form.js';
 
 function fixture(getUserMedia, { stopThrows = false } = {}) {
@@ -23,10 +24,11 @@ function fixture(getUserMedia, { stopThrows = false } = {}) {
     }
   }
   let revoked = 0;
-  const win = { navigator: { mediaDevices: { getUserMedia: getUserMedia || (async () => stream) } }, MediaRecorder: Recorder, Blob, URL: { createObjectURL: () => 'blob:practice', revokeObjectURL: () => { revoked++; } } };
+  const media = new dom.window.EventTarget(); media.getUserMedia = getUserMedia || (async () => stream);
+  const win = { navigator: { mediaDevices: media }, MediaRecorder: Recorder, Blob, URL: { createObjectURL: () => 'blob:practice', revokeObjectURL: () => { revoked++; } } };
   let dispose;
   wireMicrophoneCheck(root, { win, onUnmount: (fn) => { dispose = fn; } });
-  return { dom, root, stream, player, dispose, stopped: () => stopped, revoked: () => revoked };
+  return { dom, win, root, stream, player, dispose, stopped: () => stopped, revoked: () => revoked };
 }
 
 test('mic practice requests access only on click, offers playback, releases tracks and clip on unmount', { skip: SKIP }, async () => {
@@ -37,7 +39,14 @@ test('mic practice requests access only on click, offers playback, releases trac
     assert.equal(f.root.querySelector('[data-mic-stop]').disabled, false);
     f.root.querySelector('[data-mic-stop]').click();
     assert.equal(f.player.hidden, false);
+    assert.match(f.root.querySelector('.mic-result').textContent, /listen to your test/);
+    const confirmation = f.root.querySelector('[data-mic-confirm]');
+    assert.equal(confirmation.disabled, true, 'file bytes alone cannot pass a microphone test');
+    f.player.dispatchEvent(new f.dom.window.Event('play'));
+    assert.equal(confirmation.disabled, false);
+    confirmation.checked = true; confirmation.dispatchEvent(new f.dom.window.Event('change'));
     assert.match(f.root.querySelector('.mic-result').textContent, /^✓.*successful/);
+    assert.equal(f.dispose.isReady(), true);
     assert.equal(f.player.getAttribute('src'), 'blob:practice');
     assert.ok(f.stopped() > 0);
     f.dispose();
@@ -55,6 +64,36 @@ test('a recorder stop failure releases the microphone and offers retry', { skip:
     assert.equal(f.root.querySelector('[data-mic-start]').disabled, false);
     assert.match(f.root.querySelector('.mic-result').textContent, /failed/i);
     assert.doesNotThrow(f.dispose);
+  } finally { f.dispose(); f.dom.window.close(); }
+});
+
+test('a near-silent preflight stays failed even when a nonempty file can be played', { skip: SKIP }, async () => {
+  const f = fixture(); const signal = syntheticMicrophone(f.win, { amplitude: .0002 });
+  f.win.navigator.mediaDevices.getUserMedia = async () => signal.stream;
+  const previousNow = Date.now; Date.now = () => 1_000_000 + signal.now();
+  try {
+    await f.root.querySelector('[data-mic-start]').onclick(); signal.tick(5000);
+    f.root.querySelector('[data-mic-stop]').click();
+    assert.match(f.root.querySelector('.mic-result').textContent, /needs attention/);
+    assert.match(f.root.querySelector('[data-mic-status]').textContent, /very little audible input/);
+    f.player.dispatchEvent(new f.dom.window.Event('play'));
+    const confirm = f.root.querySelector('[data-mic-confirm]'); assert.equal(confirm.disabled, true);
+    confirm.checked = true; confirm.dispatchEvent(new f.dom.window.Event('change'));
+    assert.equal(f.dispose.isReady(), false);
+  } finally { f.dispose(); signal.restore(); Date.now = previousNow; f.dom.window.close(); }
+});
+
+test('changing devices invalidates a previously confirmed microphone test', { skip: SKIP }, async () => {
+  const f = fixture();
+  try {
+    await f.root.querySelector('[data-mic-start]').onclick(); f.root.querySelector('[data-mic-stop]').click();
+    f.player.dispatchEvent(new f.dom.window.Event('play'));
+    const confirm = f.root.querySelector('[data-mic-confirm]'); confirm.checked = true; confirm.dispatchEvent(new f.dom.window.Event('change'));
+    assert.equal(f.dispose.isReady(), true);
+    f.win.navigator.mediaDevices.dispatchEvent(new f.dom.window.Event('devicechange'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(f.dispose.isReady(), false); assert.equal(confirm.checked, false); assert.equal(confirm.disabled, true);
+    assert.match(f.root.querySelector('.mic-result').textContent, /devices changed/);
   } finally { f.dispose(); f.dom.window.close(); }
 });
 

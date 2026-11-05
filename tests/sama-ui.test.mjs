@@ -275,7 +275,7 @@ test('the exam hall serves a SAMA paper with the timers and controls the candida
     assert.match(view.textContent, /Technology Risk Consultant - SAMA/);
 
     // The exam hall: rules gate acknowledged like a candidate who pressed Start.
-    b.window.sessionStorage.setItem(`ecod.exam.ack.${aid}`, '1');
+    b.window.sessionStorage.setItem(`ecod.exam.ack.${aid}`, 'microphone-confirmed-v1');
     await candidate.quizView(view, { id: aid });
     await flush(200);
 

@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { SKIP } from './helpers/jsdom.mjs';
 import { bootSpa, flush } from './helpers/spa.mjs';
 import { makeWorld } from './helpers/world.mjs';
+import { installPreflightCapture, confirmPreflight } from './helpers/mic-preflight.mjs';
 
 const CANDIDATE = { id: 'u1', username: 'rohit', name: 'Rohit Verma', role: 'candidate', email: '' };
 
@@ -33,6 +34,7 @@ test('journey: allocated -> exam hall -> every question locked -> submitted, all
     assert.match(spa.view.querySelector('.mic-result').textContent, /not tested|unavailable/);
 
     // Exam hall: the rules gate first; entering needs the acknowledgement.
+    installPreflightCapture(spa.window);
     spa.window.location.hash = `#/assessments/${assessmentId}/quiz`;
     await cand.quizView(spa.view, { id: assessmentId });
     await flush(60);
@@ -42,6 +44,8 @@ test('journey: allocated -> exam hall -> every question locked -> submitted, all
     const ack = spa.view.querySelector('#exam-ack');
     ack.checked = true;
     ack.dispatchEvent(new spa.window.Event('change', { bubbles: true }));
+    assert.equal(btn.disabled, true, 'acknowledging rules does not skip the microphone check');
+    await confirmPreflight(spa.view, spa.window);
     assert.equal(btn.disabled, false);
     btn.click();
     await flush(150);
@@ -134,7 +138,7 @@ test('one blocked paste into the answer box is logged once, as paste_attempt', {
     },
   });
   try {
-    spa.window.sessionStorage.setItem('ecod.exam.ack.asm1', '1');
+    spa.window.sessionStorage.setItem('ecod.exam.ack.asm1', 'microphone-confirmed-v1');
     const cand = await import('../public/js/views/candidate.js');
     await cand.quizView(spa.view, { id: 'asm1' });
     await flush(80);

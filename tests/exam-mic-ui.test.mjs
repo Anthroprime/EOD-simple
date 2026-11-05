@@ -13,6 +13,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { JSDOM, SKIP } from './helpers/jsdom.mjs';
+import { syntheticMicrophone } from './helpers/microphone.mjs';
+import { confirmPreflight } from './helpers/mic-preflight.mjs';
 
 const flush = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -40,10 +42,11 @@ function openQuestionPayload({ phase = 'answer', audio_required = true } = {}) {
 
 function fakeRecorder(window) {
   // Emits a tiny real blob on stop(), i.e. a captured answer that fits storage.
-  class FakeMediaRecorder {
+  class FakeMediaRecorder extends window.EventTarget {
     static isTypeSupported(type) { return type.startsWith('audio/webm'); }
     constructor(stream, opts) {
-      FakeMediaRecorder.created.push({ stream, opts });
+      super();
+      FakeMediaRecorder.created.push({ stream, opts, instance: this });
       this.state = 'inactive';
       this.mimeType = (opts && opts.mimeType) || 'audio/webm';
     }
@@ -56,6 +59,7 @@ function fakeRecorder(window) {
       const finish = () => {
         if (this.ondataavailable) this.ondataavailable({ data: new window.Blob(['abcd'], { type: 'audio/webm' }) });
         if (this.onstop) this.onstop();
+        this.dispatchEvent(new window.Event('stop'));
       };
       if (FakeMediaRecorder.flushDelay) setTimeout(finish, FakeMediaRecorder.flushDelay);
       else finish();
@@ -66,7 +70,7 @@ function fakeRecorder(window) {
   return FakeMediaRecorder;
 }
 
-async function setupDom({ payload, capture = true }) {
+async function setupDom({ payload, capture = true, gate = false }) {
   const dom = new JSDOM(
     `<!doctype html><html><body>
        <div id="sidebar"></div><div id="topbar"></div><div id="nav-scrim"></div>
@@ -75,7 +79,8 @@ async function setupDom({ payload, capture = true }) {
     { url: 'http://localhost:3000/#/assessments/asm1/quiz', pretendToBeVisual: true },
   );
   const { window } = dom;
-  const calls = { next: [], phase: [], integrity: [], submit: [] };
+  const calls = { next: [], phase: [], integrity: [], submit: [], paper: [] };
+  window.HTMLMediaElement.prototype.pause = function () {};
   if (capture) {
     Object.defineProperty(window.navigator, 'mediaDevices', {
       configurable: true,
@@ -86,11 +91,12 @@ async function setupDom({ payload, capture = true }) {
   const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
   globalThis.fetch = async (url, opts = {}) => {
     const method = (opts.method || 'GET').toUpperCase();
-    const path = String(url).replace(/^\/api/, '');
+    const path = String(url).replace(/^\/api/, '').split('?')[0];
     const body = opts.body ? JSON.parse(opts.body) : {};
     if (path.includes('/meta/bootstrap')) return json({ pipelineStages: [], assessmentStatuses: [], userRoles: [], questionTypes: [], difficulties: [] });
     if (path.includes('/auth/me')) return json({ user: { id: 'u1', name: 'Rohit', role: 'candidate', email: '' }, candidate: { id: 'c1' } });
-    if (path === '/candidate/assessments/asm1' && method === 'GET') return json(payload());
+    if (path === '/candidate/assessments') return json({ assessments: [{ id: 'asm1', status: gate === true ? 'assigned' : gate || 'in_progress', question_count: 10, role_name: 'RSA' }] });
+    if (path === '/candidate/assessments/asm1' && method === 'GET') { calls.paper.push({ takeover: String(url).includes('takeover=1') }); return json(payload()); }
     if (path.endsWith('/phase')) { calls.phase.push(body); return json({ phase: 'answer', remaining_ms: 60_000 }); }
     if (path.endsWith('/next')) { calls.next.push(body); return json({ complete: false, index: payload().exam.index + 1, total: 10 }); }
     if (path.endsWith('/submit')) { calls.submit.push(body); return json({ status: 'submitted' }); }
@@ -120,7 +126,7 @@ async function setupDom({ payload, capture = true }) {
     HashChangeEvent: window.HashChangeEvent,
   });
   window.localStorage.setItem('ecod.token', 'test-token');
-  window.sessionStorage.setItem('ecod.exam.ack.asm1', '1'); // skip the rules gate
+  if (!gate) window.sessionStorage.setItem('ecod.exam.ack.asm1', 'microphone-confirmed-v1'); // skip the rules gate
 
   const app = await import('../public/js/app.js');
   app.state.user = { id: 'u1', name: 'Rohit', role: 'candidate', email: '' };
@@ -134,6 +140,7 @@ async function setupDom({ payload, capture = true }) {
 }
 
 function teardown(ctx) {
+  ctx.window.document.dispatchEvent(new ctx.window.Event('ecod:view-unmount'));
   ctx.restoreTicker();
   ctx.dom.window.close();
   for (const k of ['window', 'document', 'location', 'localStorage', 'sessionStorage', 'Blob', 'FileReader', 'requestAnimationFrame', 'cancelAnimationFrame', 'HashChangeEvent', 'fetch']) {
@@ -150,6 +157,8 @@ test('an open question renders the mandatory microphone beside the optional text
     await flush();
 
     assert.ok(view.querySelector('#rec-btn'), 'the record control is rendered for a standard open question');
+    assert.equal(view.querySelector('[data-mic-device]'), null, 'microphone selection belongs before the test, never on each question');
+    assert.ok(view.querySelector('[data-mic-level]'), 'live level monitoring remains on answer screens');
     assert.equal(view.querySelector('#rec-label').textContent.trim(), 'Record answer');
     assert.ok(view.querySelector('.exam-answer').classList.contains('has-audio'), 'the answer box uses the mic layout');
     assert.match(view.querySelector('#rec-state').textContent, /Required/i);
@@ -161,6 +170,174 @@ test('an open question renders the mandatory microphone beside the optional text
   } finally {
     teardown(ctx);
   }
+});
+
+test('new exam entry waits for a spoken test and playback confirmation without starting the paper clock', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload(), gate: true });
+  const f = syntheticMicrophone(ctx.window);
+  ctx.window.URL.createObjectURL = () => 'blob:preflight'; ctx.window.URL.revokeObjectURL = () => {};
+  ctx.window.navigator.mediaDevices.getUserMedia = async () => f.stream;
+  const previousNow = Date.now; Date.now = () => 1_000_000 + f.now();
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' }); await flush();
+    const ack = view.querySelector('#exam-ack'); ack.checked = true; ack.onchange();
+    assert.equal(view.querySelector('#exam-enter').disabled, true);
+    assert.equal(ctx.calls.paper.length, 0);
+    await view.querySelector('[data-mic-start]').onclick(); f.tick(3000); view.querySelector('[data-mic-stop]').click();
+    assert.equal(view.querySelector('#exam-enter').disabled, true, 'nonempty audio and signal detection alone do not pass');
+    const confirm = view.querySelector('[data-mic-confirm]'); assert.equal(confirm.disabled, true);
+    view.querySelector('[data-mic-player]').dispatchEvent(new ctx.window.Event('play'));
+    confirm.checked = true; confirm.dispatchEvent(new ctx.window.Event('change'));
+    assert.equal(view.querySelector('#exam-enter').disabled, false);
+    await view.querySelector('#exam-enter').onclick();
+    assert.equal(ctx.calls.paper.length, 1, 'only entry starts the paper'); assert.equal(f.closed(), 1);
+    assert.ok(view.querySelector('#rec-btn'));
+  } finally { teardown(ctx); Date.now = previousNow; f.restore(); }
+});
+
+test('a deliberate device takeover is preserved through the mandatory microphone gate', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload(), gate: 'in_progress' });
+  ctx.window.URL.createObjectURL = () => 'blob:takeover-test'; ctx.window.URL.revokeObjectURL = () => {};
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1', takeover: true });
+    const ack = view.querySelector('#exam-ack'); ack.checked = true; ack.onchange();
+    assert.equal(ctx.calls.paper.length, 0, 'taking over cannot skip the mandatory test');
+    await confirmPreflight(view, ctx.window);
+    await view.querySelector('#exam-enter').onclick();
+    assert.deepEqual(ctx.calls.paper, [{ takeover: true }], 'the explicitly requested takeover reaches the server after confirmation');
+  } finally { teardown(ctx); }
+});
+
+test('resuming in a fresh browser session requires a microphone test and explains the running deadline', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload(), gate: 'in_progress' });
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' });
+    const ack = view.querySelector('#exam-ack'); ack.checked = true; ack.onchange();
+    assert.equal(view.querySelector('#exam-enter').disabled, true);
+    assert.match(view.textContent, /existing exam clock continues running/);
+    await view.querySelector('#exam-enter').onclick();
+    assert.equal(ctx.calls.paper.length, 0, 'rules acknowledgement cannot bypass the test on resume');
+  } finally { teardown(ctx); }
+});
+
+test('an older rules-only acknowledgement cannot bypass the mandatory microphone test', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload(), gate: true });
+  try {
+    ctx.window.sessionStorage.setItem('ecod.exam.ack.asm1', '1');
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' });
+    const ack = view.querySelector('#exam-ack'); ack.checked = true; ack.onchange();
+    assert.equal(view.querySelector('#exam-enter').disabled, true);
+    assert.ok(view.querySelector('[data-mic-start]'));
+    assert.equal(ctx.calls.paper.length, 0);
+  } finally { teardown(ctx); }
+});
+
+test('a browser without microphone capture cannot enter by acknowledging the rules', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload(), gate: true, capture: false });
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' });
+    const ack = view.querySelector('#exam-ack'); ack.checked = true; ack.onchange();
+    assert.equal(view.querySelector('#exam-enter').disabled, true);
+    assert.match(view.textContent, /cannot enter without a microphone test/);
+    await view.querySelector('#exam-enter').onclick();
+    assert.equal(ctx.calls.paper.length, 0);
+  } finally { teardown(ctx); }
+});
+
+test('denied microphone access keeps exam entry locked and never starts the paper', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload(), gate: true });
+  ctx.window.navigator.mediaDevices.getUserMedia = async () => { throw Object.assign(new Error('Blocked'), { name: 'NotAllowedError' }); };
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' });
+    const ack = view.querySelector('#exam-ack'); ack.checked = true; ack.onchange();
+    await view.querySelector('[data-mic-start]').onclick();
+    assert.match(view.querySelector('[data-mic-status]').textContent, /Allow access/);
+    assert.equal(view.querySelector('#exam-enter').disabled, true);
+    assert.equal(ctx.calls.paper.length, 0);
+  } finally { teardown(ctx); }
+});
+
+test('quiet input warns live; a saved quiet clip needs playback and an explicit keep before manual locking', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload() });
+  const f = syntheticMicrophone(ctx.window, { amplitude: .0002 });
+  ctx.window.navigator.mediaDevices.getUserMedia = async () => f.stream;
+  const previousNow = Date.now; Date.now = () => 1_000_000 + f.now();
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' }); await flush();
+    await view.querySelector('#rec-btn').onclick(); f.tick(5000);
+    assert.match(view.querySelector('[data-mic-health]').textContent, /very quiet/);
+    assert.equal(view.querySelector('#exam-next').disabled, true);
+    await view.querySelector('#rec-btn').onclick();
+    assert.equal(view.querySelector('#audio-quality-warning').hidden, false);
+    assert.equal(view.querySelector('#answer-audio-preview').hidden, false);
+    await view.querySelector('#exam-next').onclick(); assert.equal(ctx.calls.next.length, 0);
+    const keep = view.querySelector('#keep-question-audio'); assert.equal(keep.disabled, true);
+    await keep.onclick(); assert.equal(ctx.calls.next.length, 0, 'cannot confirm before playback');
+    view.querySelector('#answer-audio-preview').dispatchEvent(new ctx.window.Event('play'));
+    await keep.onclick(); assert.equal(ctx.calls.next.length, 1);
+    assert.ok(ctx.calls.next[0].answer.audio_b64 || ctx.calls.next[0].answer.audio_keep);
+  } finally { teardown(ctx); Date.now = previousNow; f.restore(); }
+});
+
+test('time expiry still saves a quiet live recording instead of stranding the exam', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload() });
+  const f = syntheticMicrophone(ctx.window, { amplitude: .0001 });
+  ctx.window.navigator.mediaDevices.getUserMedia = async () => f.stream;
+  const previousNow = Date.now; Date.now = () => 1_000_000 + f.now();
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' }); await flush();
+    await view.querySelector('#rec-btn').onclick(); f.tick(5000);
+    const next = view.querySelector('#exam-next'); next.dataset.force = '1'; await next.onclick();
+    assert.equal(ctx.calls.next.length, 1); assert.ok(ctx.calls.next[0].answer.audio_b64);
+    assert.equal(f.closed(), 1);
+  } finally { teardown(ctx); Date.now = previousNow; f.restore(); }
+});
+
+test('an unexpected recorder stop finishes the final chunk and offers playback without another stop click', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload() });
+  const f = syntheticMicrophone(ctx.window);
+  ctx.window.navigator.mediaDevices.getUserMedia = async () => f.stream;
+  const previousNow = Date.now; Date.now = () => 1_000_000 + f.now();
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' }); await flush();
+    await view.querySelector('#rec-btn').onclick(); f.tick(3000);
+    ctx.window.MediaRecorder.created.at(-1).instance.stop(); await flush();
+    assert.equal(view.querySelector('#rec-label').textContent, 'Record answer');
+    assert.equal(view.querySelector('#answer-audio-preview').hidden, false);
+    assert.match(view.querySelector('#audio-quality-message').textContent, /ended unexpectedly/);
+    assert.equal(ctx.calls.next.length, 0, 'an input failure must not lock or advance the answer');
+    assert.equal(f.closed(), 1);
+  } finally { teardown(ctx); Date.now = previousNow; f.restore(); }
+});
+
+test('muting or an unexpected recorder stop warns immediately and a fresh take resets the warning', { skip: SKIP }, async () => {
+  const ctx = await setupDom({ payload: () => openQuestionPayload() });
+  const f = syntheticMicrophone(ctx.window);
+  ctx.window.navigator.mediaDevices.getUserMedia = async () => f.stream;
+  const previousNow = Date.now; Date.now = () => 1_000_000 + f.now();
+  try {
+    const { quizView } = await import('../public/js/views/candidate.js');
+    const view = document.getElementById('view'); await quizView(view, { id: 'asm1' }); await flush();
+    await view.querySelector('#rec-btn').onclick(); f.tick(3000);
+    f.track.muted = true; f.event('mute');
+    assert.match(view.querySelector('[data-mic-health]').textContent, /interrupted or muted/);
+    await view.querySelector('#rec-btn').onclick();
+    assert.match(view.querySelector('#audio-quality-message').textContent, /muted or disconnected/);
+    f.track.muted = false; f.track.readyState = 'live';
+    await view.querySelector('#rec-btn').onclick(); f.tick(3000);
+    await view.querySelector('#rec-btn').onclick();
+    assert.equal(view.querySelector('#audio-quality-warning').hidden, true);
+    assert.equal(view.querySelector('#exam-next').disabled, false);
+  } finally { teardown(ctx); Date.now = previousNow; f.restore(); }
 });
 
 test('SAMA microphone capture still starts when optional speech recognition throws', { skip: SKIP }, async () => {
@@ -377,7 +554,7 @@ test('the review window tells the candidate to record and offers a microphone pr
     assert.match(view.querySelector('.exam-review').textContent, /microphone is required/i);
     view.querySelector('#mic-check').click();
     await flush(40);
-    assert.match(view.querySelector('#mic-check-state').textContent, /Microphone ready/i);
+    assert.match(view.querySelector('#mic-check-state').textContent, /Microphone access granted/i);
 
     const next = view.querySelector('#exam-next');
     assert.match(next.textContent, /Start answering/);
